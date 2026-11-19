@@ -1,0 +1,852 @@
+name: Build APK Android
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+
+      - name: Configuration Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Configuration Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+
+      - name: Cache Gradle et NPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.npm
+          key: ${{ runner.os }}-build-${{ hashFiles('**/*.gradle*', '**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-build-
+
+      - name: Construction de l'environnement PWA → APK
+        run: |
+          mkdir -p capacitor-app/www
+          rsync -av --exclude='capacitor-app' --exclude='.git' --exclude='.github' ./ capacitor-app/www/
+          cd capacitor-app
+          npm init -y
+          npm install @capacitor/core @capacitor/android @capacitor/haptics @capacitor/local-notifications
+          npm install @capawesome-team/capacitor-android-foreground-service
+          npm install -D @capacitor/cli
+          cat > capacitor.config.json << JSONEOF
+          {
+            "appId": "com.mekeirish.recorder5",
+            "appName": "Recorder5",
+            "webDir": "www",
+            "bundledWebRuntime": true
+          }
+          JSONEOF
+          npx cap init "Recorder5" "com.mekeirish.recorder5" --web-dir www
+          npx cap add android
+
+      - name: 🔐 Détection et injection automatique des permissions
+        run: |
+          cd capacitor-app/www
+          MANIFEST="../android/app/src/main/AndroidManifest.xml"
+          add_permission() {
+            local perm="$1"
+            if ! grep -q "android.permission.$perm" "$MANIFEST"; then
+              sed -i "/<manifest/a\    <uses-permission android:name=\"android.permission.$perm\" />" "$MANIFEST"
+            fi
+          }
+          rm -f .need_*_shim
+          add_permission "INTERNET"
+          add_permission "ACCESS_NETWORK_STATE"
+          if grep -rq -E "passerAppelDirect" .; then add_permission "CALL_PHONE"; touch .need_call_shim; fi
+          if grep -rq -E "navigator\.vibrate|\.vibrate\(" .; then add_permission "VIBRATE"; touch .need_vibrate_shim; fi
+          if grep -rq -E "navigator\.geolocation|getCurrentPosition|watchPosition" .; then
+            add_permission "ACCESS_FINE_LOCATION"
+            add_permission "ACCESS_COARSE_LOCATION"
+            touch .need_geolocation_shim
+          fi
+          if grep -rq "getUserMedia" . && grep -rq -E "video\s*:\s*(true|\{)" .; then add_permission "CAMERA"; touch .need_camera_shim; fi
+          if grep -rq "getUserMedia" . && grep -rq -E "audio\s*:\s*(true|\{)" .; then
+            add_permission "RECORD_AUDIO"
+            add_permission "MODIFY_AUDIO_SETTINGS"
+            add_permission "FOREGROUND_SERVICE"
+            add_permission "FOREGROUND_SERVICE_MICROPHONE"
+            add_permission "WAKE_LOCK"
+            touch .need_microphone_shim
+            touch .need_bg_service
+          fi
+          if grep -rq -E "new Notification\(|Notification\.requestPermission" .; then 
+            add_permission "POST_NOTIFICATIONS"
+            touch .need_notification_shim
+          fi
+
+      - name: 🔧 Configuration Service Arrière-plan
+        run: |
+          cd capacitor-app
+          if [ -f www/.need_bg_service ]; then
+            MANIFEST="android/app/src/main/AndroidManifest.xml"
+            if ! grep -q "AndroidForegroundService" "$MANIFEST"; then
+              sed -i '/<\/application>/i \        <receiver android:name="io.capawesome.capacitorjs.plugins.foregroundservice.NotificationActionBroadcastReceiver" />\n        <service android:name="io.capawesome.capacitorjs.plugins.foregroundservice.AndroidForegroundService" android:foregroundServiceType="microphone" android:exported="false" />' "$MANIFEST"
+            fi
+          fi
+
+      - name: 📱 Configuration des permissions natives (MainActivity)
+        run: |
+          cd capacitor-app
+          MAIN_ACTIVITY="android/app/src/main/java/com/mekeirish/recorder5/MainActivity.java"
+          
+          REQ_CODE=""
+          if [ -f www/.need_microphone_shim ]; then
+            REQ_CODE="$REQ_CODE
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      permissionsNeeded.add(Manifest.permission.RECORD_AUDIO);
+                  }"
+          fi
+          if [ -f www/.need_notification_shim ]; then
+            REQ_CODE="$REQ_CODE
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                          permissionsNeeded.add(Manifest.permission.POST_NOTIFICATIONS);
+                      }
+                  }"
+          fi
+
+          cat > $MAIN_ACTIVITY << EOF
+          package com.mekeirish.recorder5;
+          
+          import android.Manifest;
+          import android.content.pm.PackageManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.content.ContextCompat;
+          import com.getcapacitor.BridgeActivity;
+          import java.util.ArrayList;
+          import java.util.List;
+          
+          public class MainActivity extends BridgeActivity {
+              private static final int PERMISSION_REQUEST_CODE = 1001;
+          
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  
+                  WebView webView = this.bridge.getWebView();
+                  webView.getSettings().setMediaPlaybackRequiresUserGesture(false);
+          
+                  List<String> permissionsNeeded = new ArrayList<>();
+                  ${REQ_CODE}
+                  
+                  if (!permissionsNeeded.isEmpty()) {
+                      ActivityCompat.requestPermissions(this, permissionsNeeded.toArray(new String[0]), PERMISSION_REQUEST_CODE);
+                  }
+              }
+          }
+          EOF
+
+      - name: 🌉 Injection des shims
+        run: |
+          cd capacitor-app/www
+          NEED_VIBRATE=false
+          NEED_NOTIFICATION=false
+          [ -f .need_vibrate_shim ] && NEED_VIBRATE=true
+          [ -f .need_notification_shim ] && NEED_NOTIFICATION=true
+          if [ "$NEED_VIBRATE" = "true" ] || [ "$NEED_NOTIFICATION" = "true" ]; then
+            cat > shims.js << 'SHIMEOF'
+          (function() {
+            var Capacitor = window.Capacitor;
+            console.log('🔌 Shims:', !!(Capacitor && Capacitor.Plugins) ? 'natif' : 'web');
+          })();
+          SHIMEOF
+            if [ "$NEED_VIBRATE" = "true" ]; then
+              cat >> shims.js << 'VIBEOF'
+          (function() {
+            var C = window.Capacitor;
+            if (C && C.Plugins && C.Plugins.Haptics) {
+              navigator.vibrate = function(p) {
+                var d = (typeof p === 'number') ? p : (Array.isArray(p) && p.length) ? p[0] : 200;
+                try { C.Plugins.Haptics.vibrate({ duration: d }); } catch(e) {}
+                return true;
+              };
+            }
+          })();
+          VIBEOF
+            fi
+            if [ "$NEED_NOTIFICATION" = "true" ]; then
+              cat >> shims.js << 'NOTIFEOF'
+          (function() {
+            var C = window.Capacitor;
+            if (C && C.Plugins && C.Plugins.LocalNotifications) {
+              C.Plugins.LocalNotifications.createChannel({
+                id: 'default', name: 'Notifications', importance: 5, visibility: 1
+              }).catch(function(){});
+              window.Notification = function(title, options) {
+                options = options || {};
+                C.Plugins.LocalNotifications.schedule({
+                  notifications: [{
+                    id: Math.floor(Math.random() * 2147483647),
+                    title: title || '',
+                    body: options.body || '',
+                    channelId: 'default',
+                    schedule: { at: new Date(Date.now() + 1000) }
+                  }]
+                }).catch(function(){});
+                return { close: function() {} };
+              };
+              window.Notification.requestPermission = function() {
+                return C.Plugins.LocalNotifications.requestPermissions().then(function(r) {
+                  return r.display === 'granted' ? 'granted' : 'denied';
+                });
+              };
+              window.Notification.permission = 'default';
+            }
+          })();
+          NOTIFEOF
+            fi
+          fi
+
+      - name: 🔌 Injection du Bridge et Background
+        run: |
+          cd capacitor-app/www
+          if [ -f .need_bg_service ]; then
+            cat > background.js << 'BGEOF'
+          (function() {
+            var started = false;
+            function startService() {
+              var C = window.Capacitor;
+              if (started || !C || !C.Plugins || !C.Plugins.ForegroundService) return;
+              started = true;
+              var FS = C.Plugins.ForegroundService;
+              FS.requestPermissions().catch(function(){}).then(function() {
+                return FS.createNotificationChannel({
+                  id: 'talkie_channel',
+                  name: 'Talkie-Walkie Audio',
+                  importance: 3
+                }).catch(function(){});
+              }).then(function() {
+                return FS.startForegroundService({
+                  id: 1,
+                  title: 'Talkie-Walkie Actif',
+                  body: 'Communication en cours en arrière-plan...',
+                  notificationChannelId: 'talkie_channel',
+                  smallIcon: 'ic_launcher'
+                });
+              }).then(function() {
+                FS.acquireWakeLock({ tag: 'talkie', timeout: 0 }).catch(function(){});
+              }).catch(function(e) {
+                started = false;
+                console.log("Erreur service premier plan:", e);
+              });
+            }
+            var md = navigator.mediaDevices;
+            if (md && md.getUserMedia) {
+              var orig = md.getUserMedia.bind(md);
+              md.getUserMedia = function(c) {
+                return orig(c).then(function(s) {
+                  if (c && c.audio) startService();
+                  return s;
+                });
+              };
+            }
+          })();
+          BGEOF
+          fi
+          
+          MAIN_HTML=$(find . -maxdepth 1 -name "*.html" | head -n 1)
+          if [ -n "$MAIN_HTML" ]; then
+            curl -f -s -o bridge.js "https://raw.githubusercontent.com/mekeirish/APK-Creator/main/bridge.js"
+            if [ -f "../node_modules/@capacitor/core/dist/capacitor.js" ]; then
+              cp ../node_modules/@capacitor/core/dist/capacitor.js capacitor.js
+            else
+              touch capacitor.js
+            fi
+            node -e "
+              const fs = require('fs');
+              const h = '${MAIN_HTML}';
+              let c = fs.readFileSync(h, 'utf8');
+              let parts = c.split(/<\/body>/i);
+              if (parts.length > 1) {
+                let last = parts.pop();
+                let s = '<script src="capacitor.js"><\/script>\n';
+                if (fs.existsSync('shims.js')) s += '<script src="shims.js"><\/script>\n';
+                if (fs.existsSync('background.js')) s += '<script src="background.js"><\/script>\n';
+                s += '<script src="bridge.js"><\/script>\n</body>';
+                fs.writeFileSync(h, parts.join('</body>') + s + last, 'utf8');
+              } else {
+                let a = '<script src="capacitor.js"><\/script>\n';
+                if (fs.existsSync('shims.js')) a += '<script src="shims.js"><\/script>\n';
+                if (fs.existsSync('background.js')) a += '<script src="background.js"><\/script>\n';
+                a += '<script src="bridge.js"><\/script>\n';
+                fs.appendFileSync(h, a);
+              }
+            "
+          fi
+
+      - name: 🔄 Sync assets Android
+        run: |
+          cd capacitor-app
+          npx cap sync android
+
+      - name: 🎙️ Son interne natif (plugin MediaProjection)
+        run: |
+          cd capacitor-app
+          if grep -rqE "Plugins[.]InternalAudio" www; then
+            echo "Plugin InternalAudio detecte"
+            MANIFEST="android/app/src/main/AndroidManifest.xml"
+            JAVA_DIR="android/app/src/main/java/com/mekeirish/recorder5"
+            for P in RECORD_AUDIO MODIFY_AUDIO_SETTINGS FOREGROUND_SERVICE FOREGROUND_SERVICE_MEDIA_PROJECTION FOREGROUND_SERVICE_MICROPHONE POST_NOTIFICATIONS WAKE_LOCK; do
+              if ! grep -q "android.permission.$P" "$MANIFEST"; then
+                sed -i "/<manifest/a\    <uses-permission android:name=\"android.permission.$P\" />" "$MANIFEST"
+              fi
+            done
+            if ! grep -q "InternalAudioService" "$MANIFEST"; then
+              sed -i '/<\/application>/i \        <service android:name="com.mekeirish.recorder5.InternalAudioService" android:exported="false" android:foregroundServiceType="mediaProjection|microphone" />' "$MANIFEST"
+            fi
+            mkdir -p "$JAVA_DIR"
+
+            cat > "$JAVA_DIR/InternalAudioService.java" << 'JAVAEOF'
+          package com.mekeirish.recorder5;
+
+          import android.annotation.SuppressLint;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.media.AudioAttributes;
+          import android.media.AudioFormat;
+          import android.media.AudioPlaybackCaptureConfiguration;
+          import android.media.AudioRecord;
+          import android.media.MediaRecorder;
+          import android.media.projection.MediaProjection;
+          import android.media.projection.MediaProjectionManager;
+          import android.os.Build;
+          import android.os.IBinder;
+          import java.io.IOException;
+          import java.io.RandomAccessFile;
+          import java.nio.ByteBuffer;
+          import java.nio.ByteOrder;
+
+          @SuppressLint({"NewApi", "MissingPermission"})
+          public class InternalAudioService extends Service {
+              public static final String CHANNEL_ID = "recorder_capture";
+              public static final int RATE = 44100;
+              public static volatile boolean running = false;
+              public static volatile boolean stopRequested = false;
+              public static volatile long startedAt = 0;
+              public static volatile long lastDuration = 0;
+              public static volatile double level = 0;
+              public static volatile String lastPath = null;
+              public static volatile String lastError = null;
+
+              private MediaProjection projection;
+              private AudioRecord internalRec;
+              private AudioRecord micRec;
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent == null || !"START".equals(intent.getAction())) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  final boolean withMic = intent.getBooleanExtra("withMic", false);
+                  final String path = intent.getStringExtra("path");
+                  final int resultCode = intent.getIntExtra("resultCode", 0);
+                  final Intent data = intent.getParcelableExtra("data");
+                  try {
+                      startAsForeground(withMic);
+                      MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+                      projection = mpm.getMediaProjection(resultCode, data);
+                      if (projection == null) throw new IllegalStateException("Projection indisponible");
+                      projection.registerCallback(new MediaProjection.Callback() {
+                          @Override
+                          public void onStop() {
+                              stopRequested = true;
+                          }
+                      }, null);
+
+                      AudioPlaybackCaptureConfiguration cfg = new AudioPlaybackCaptureConfiguration.Builder(projection)
+                              .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                              .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                              .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                              .build();
+                      AudioFormat fmt = new AudioFormat.Builder()
+                              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                              .setSampleRate(RATE)
+                              .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                              .build();
+                      int minBuf = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
+                      int bufSize = Math.max(minBuf * 2, 16384);
+                      internalRec = new AudioRecord.Builder()
+                              .setAudioFormat(fmt)
+                              .setBufferSizeInBytes(bufSize)
+                              .setAudioPlaybackCaptureConfig(cfg)
+                              .build();
+
+                      if (withMic) {
+                          AudioFormat mf = new AudioFormat.Builder()
+                                  .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                  .setSampleRate(RATE)
+                                  .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                                  .build();
+                          int minMic = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                          micRec = new AudioRecord.Builder()
+                                  .setAudioSource(MediaRecorder.AudioSource.MIC)
+                                  .setAudioFormat(mf)
+                                  .setBufferSizeInBytes(Math.max(minMic * 2, 8192))
+                                  .build();
+                      }
+                  } catch (Exception e) {
+                      fail(e.getMessage());
+                      return START_NOT_STICKY;
+                  }
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          capture(path, withMic);
+                      }
+                  }).start();
+                  return START_NOT_STICKY;
+              }
+
+              private void startAsForeground(boolean withMic) {
+                  NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                  Notification.Builder b;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "Enregistrement", NotificationManager.IMPORTANCE_LOW);
+                      nm.createNotificationChannel(ch);
+                      b = new Notification.Builder(this, CHANNEL_ID);
+                  } else {
+                      b = new Notification.Builder(this);
+                  }
+                  b.setContentTitle("Enregistrement en cours")
+                          .setContentText("Capture audio active")
+                          .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                          .setOngoing(true);
+                  Notification n = b.build();
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
+                      if (withMic && Build.VERSION.SDK_INT >= 30) {
+                          type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+                      }
+                      startForeground(1337, n, type);
+                  } else {
+                      startForeground(1337, n);
+                  }
+              }
+
+              private void fail(String msg) {
+                  lastError = (msg == null) ? "Erreur de capture" : msg;
+                  running = false;
+                  level = 0;
+                  try {
+                      if (projection != null) projection.stop();
+                  } catch (Exception e) {
+                  }
+                  stopForeground(true);
+                  stopSelf();
+              }
+
+              private void writeHeader(RandomAccessFile f, long dataLen, int channels) throws IOException {
+                  ByteBuffer b = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN);
+                  b.put(new byte[]{'R', 'I', 'F', 'F'});
+                  b.putInt((int) (36 + dataLen));
+                  b.put(new byte[]{'W', 'A', 'V', 'E'});
+                  b.put(new byte[]{'f', 'm', 't', ' '});
+                  b.putInt(16);
+                  b.putShort((short) 1);
+                  b.putShort((short) channels);
+                  b.putInt(RATE);
+                  b.putInt(RATE * channels * 2);
+                  b.putShort((short) (channels * 2));
+                  b.putShort((short) 16);
+                  b.put(new byte[]{'d', 'a', 't', 'a'});
+                  b.putInt((int) dataLen);
+                  f.seek(0);
+                  f.write(b.array());
+              }
+
+              private void capture(String path, boolean withMic) {
+                  RandomAccessFile f = null;
+                  long dataLen = 0;
+                  try {
+                      f = new RandomAccessFile(path, "rw");
+                      f.setLength(0);
+                      writeHeader(f, 0, 2);
+                      internalRec.startRecording();
+                      if (withMic && micRec != null) micRec.startRecording();
+                      short[] buf = new short[2048];
+                      short[] mic = new short[1024];
+                      ByteBuffer bb = ByteBuffer.allocate(4096).order(ByteOrder.LITTLE_ENDIAN);
+                      while (!stopRequested) {
+                          int n = internalRec.read(buf, 0, buf.length);
+                          if (n < 0) throw new IOException("Lecture audio interne : " + n);
+                          if (n == 0) continue;
+                          int frames = n / 2;
+                          int mn = 0;
+                          if (withMic && micRec != null) {
+                              mn = micRec.read(mic, 0, frames);
+                              if (mn < 0) mn = 0;
+                          }
+                          bb.clear();
+                          int peak = 0;
+                          for (int i = 0; i < frames; i++) {
+                              int l = buf[2 * i];
+                              int r = buf[2 * i + 1];
+                              if (i < mn) {
+                                  l += mic[i];
+                                  r += mic[i];
+                              }
+                              if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
+                              if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
+                              bb.putShort((short) l);
+                              bb.putShort((short) r);
+                              int a = Math.abs(l);
+                              if (a > peak) peak = a;
+                          }
+                          f.write(bb.array(), 0, frames * 4);
+                          dataLen += frames * 4;
+                          level = peak / 32768.0;
+                      }
+                  } catch (Exception e) {
+                      lastError = (e.getMessage() == null) ? "Erreur de capture" : e.getMessage();
+                  } finally {
+                      try { if (internalRec != null) { internalRec.stop(); internalRec.release(); } } catch (Exception e) { }
+                      try { if (micRec != null) { micRec.stop(); micRec.release(); } } catch (Exception e) { }
+                      try { if (projection != null) projection.stop(); } catch (Exception e) { }
+                      try {
+                          if (f != null) {
+                              writeHeader(f, dataLen, 2);
+                              f.close();
+                          }
+                      } catch (Exception e) { }
+                      lastPath = path;
+                      lastDuration = dataLen * 1000L / (RATE * 4L);
+                      level = 0;
+                      running = false;
+                      stopForeground(true);
+                      stopSelf();
+                  }
+              }
+          }
+          JAVAEOF
+
+            cat > "$JAVA_DIR/InternalAudioPlugin.java" << 'JAVAEOF'
+          package com.mekeirish.recorder5;
+
+          import android.Manifest;
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.content.ContentResolver;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.media.projection.MediaProjectionManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import androidx.activity.result.ActivityResult;
+          import androidx.core.content.ContextCompat;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.PermissionState;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.ActivityCallback;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.getcapacitor.annotation.Permission;
+          import com.getcapacitor.annotation.PermissionCallback;
+          import java.io.ByteArrayInputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+
+          @SuppressLint("NewApi")
+          @CapacitorPlugin(name = "InternalAudio", permissions = {
+                  @Permission(alias = "mic", strings = { Manifest.permission.RECORD_AUDIO })
+          })
+          public class InternalAudioPlugin extends Plugin {
+
+              private File recDir() {
+                  File d = new File(getContext().getFilesDir(), "recordings");
+                  d.mkdirs();
+                  return d;
+              }
+
+              @PluginMethod
+              public void start(PluginCall call) {
+                  if (Build.VERSION.SDK_INT < 29) {
+                      call.reject("Android 10 minimum requis");
+                      return;
+                  }
+                  if (InternalAudioService.running) {
+                      call.reject("Deja en cours");
+                      return;
+                  }
+                  if (getPermissionState("mic") != PermissionState.GRANTED) {
+                      requestPermissionForAlias("mic", call, "micPermCallback");
+                      return;
+                  }
+                  askProjection(call);
+              }
+
+              @PermissionCallback
+              private void micPermCallback(PluginCall call) {
+                  if (getPermissionState("mic") == PermissionState.GRANTED) {
+                      askProjection(call);
+                  } else {
+                      call.reject("Permission micro refusee");
+                  }
+              }
+
+              private void askProjection(PluginCall call) {
+                  MediaProjectionManager mpm = (MediaProjectionManager) getContext().getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+                  startActivityForResult(call, mpm.createScreenCaptureIntent(), "projectionResult");
+              }
+
+              @ActivityCallback
+              private void projectionResult(PluginCall call, ActivityResult result) {
+                  if (call == null) return;
+                  if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null) {
+                      call.reject("Capture refusee");
+                      return;
+                  }
+                  boolean withMic = call.getBoolean("mic", false);
+                  String name = "rec_" + System.currentTimeMillis() + ".wav";
+                  File out = new File(recDir(), name);
+
+                  InternalAudioService.stopRequested = false;
+                  InternalAudioService.lastError = null;
+                  InternalAudioService.lastPath = null;
+                  InternalAudioService.level = 0;
+                  InternalAudioService.startedAt = System.currentTimeMillis();
+                  InternalAudioService.running = true;
+
+                  Intent svc = new Intent(getContext(), InternalAudioService.class);
+                  svc.setAction("START");
+                  svc.putExtra("resultCode", result.getResultCode());
+                  svc.putExtra("data", result.getData());
+                  svc.putExtra("withMic", withMic);
+                  svc.putExtra("path", out.getAbsolutePath());
+                  ContextCompat.startForegroundService(getContext(), svc);
+
+                  JSObject ret = new JSObject();
+                  ret.put("path", out.getAbsolutePath());
+                  ret.put("name", name);
+                  call.resolve(ret);
+              }
+
+              @PluginMethod
+              public void stop(PluginCall call) {
+                  InternalAudioService.stopRequested = true;
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void status(PluginCall call) {
+                  JSObject o = new JSObject();
+                  boolean run = InternalAudioService.running;
+                  o.put("running", run);
+                  o.put("elapsed", run ? System.currentTimeMillis() - InternalAudioService.startedAt : InternalAudioService.lastDuration);
+                  o.put("level", InternalAudioService.level);
+                  o.put("path", InternalAudioService.lastPath);
+                  o.put("error", InternalAudioService.lastError);
+                  call.resolve(o);
+              }
+
+              @PluginMethod
+              public void list(PluginCall call) {
+                  JSArray arr = new JSArray();
+                  File[] files = recDir().listFiles();
+                  if (files != null) {
+                      for (File x : files) {
+                          if (!x.getName().endsWith(".wav")) continue;
+                          JSObject o = new JSObject();
+                          o.put("name", x.getName());
+                          o.put("path", x.getAbsolutePath());
+                          o.put("size", x.length());
+                          o.put("modified", x.lastModified());
+                          arr.put(o);
+                      }
+                  }
+                  JSObject r = new JSObject();
+                  r.put("files", arr);
+                  call.resolve(r);
+              }
+
+              @PluginMethod
+              public void remove(PluginCall call) {
+                  String path = call.getString("path");
+                  if (path == null) {
+                      call.reject("Chemin manquant");
+                      return;
+                  }
+                  File f = new File(path);
+                  if (f.getParentFile() != null && f.getParentFile().equals(recDir()) && f.delete()) {
+                      call.resolve();
+                  } else {
+                      call.reject("Suppression impossible");
+                  }
+              }
+
+              @PluginMethod
+              public void saveToDownloads(final PluginCall call) {
+                  if (Build.VERSION.SDK_INT < 29) {
+                      call.reject("Android 10 minimum requis");
+                      return;
+                  }
+                  final String name = call.getString("name", "recording.wav").replaceAll("[^A-Za-z0-9._-]", "_");
+                  final String path = call.getString("path");
+                  final String data = call.getString("data");
+                  final String mime = call.getString("mime", "audio/wav");
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              InputStream in;
+                              if (path != null) {
+                                  File f = new File(path);
+                                  if (f.getParentFile() == null || !f.getParentFile().equals(recDir())) {
+                                      call.reject("Chemin refuse");
+                                      return;
+                                  }
+                                  in = new FileInputStream(f);
+                              } else if (data != null) {
+                                  in = new ByteArrayInputStream(Base64.decode(data, Base64.DEFAULT));
+                              } else {
+                                  call.reject("Aucune donnee");
+                                  return;
+                              }
+                              ContentValues v = new ContentValues();
+                              v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                              v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                              v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Recorder");
+                              ContentResolver cr = getContext().getContentResolver();
+                              Uri uri = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                              if (uri == null) throw new IOException("Insertion impossible");
+                              OutputStream out = cr.openOutputStream(uri);
+                              byte[] b = new byte[65536];
+                              int n;
+                              while ((n = in.read(b)) > 0) {
+                                  out.write(b, 0, n);
+                              }
+                              out.close();
+                              in.close();
+                              call.resolve();
+                          } catch (Exception e) {
+                              call.reject("Echec : " + e.getMessage());
+                          }
+                      }
+                  }).start();
+              }
+          }
+          JAVAEOF
+
+            if ! grep -q "InternalAudioPlugin" "$JAVA_DIR/MainActivity.java"; then
+              sed -i 's/super.onCreate(savedInstanceState);/registerPlugin(InternalAudioPlugin.class);\n        super.onCreate(savedInstanceState);/' "$JAVA_DIR/MainActivity.java"
+            fi
+          else
+            echo "Pas de plugin InternalAudio requis"
+          fi
+
+      - name: 🔎 Vérification plugin son interne
+        run: |
+          cd capacitor-app
+          JD=android/app/src/main/java/com/mekeirish/recorder5
+          echo "--- Java ---"; ls -la $JD
+          echo "--- MainActivity ---"; cat $JD/MainActivity.java
+          echo "--- Manifest ---"; grep -n InternalAudio android/app/src/main/AndroidManifest.xml || echo "service absent"
+          if grep -rqE "Plugins[.]InternalAudio" www && [ ! -f $JD/InternalAudioPlugin.java ]; then echo "ERREUR : plugin non injecte"; exit 1; fi
+          if [ -f $JD/InternalAudioPlugin.java ] && ! grep -q "registerPlugin(InternalAudioPlugin.class)" $JD/MainActivity.java; then echo "ERREUR : plugin non enregistre"; exit 1; fi
+
+      - name: Génération icône
+        run: |
+          cd capacitor-app
+          npm install -D @capacitor/assets
+          mkdir -p assets
+          if [ -f "../icon.png" ]; then
+            cp ../icon.png assets/icon.png
+            npx @capacitor/assets generate --android
+          fi
+
+      - name: Versioning et Signature
+        run: |
+          cd capacitor-app/android/app
+          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/g" build.gradle
+          
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+            cat >> build.gradle << EOF
+          android {
+              signingConfigs {
+                  release {
+                      storeFile file("release.keystore")
+                      storePassword "${{ secrets.KEYSTORE_PASSWORD }}"
+                      keyAlias "${{ secrets.KEY_ALIAS }}"
+                      keyPassword "${{ secrets.KEY_PASSWORD }}"
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                      minifyEnabled false
+                  }
+              }
+          }
+          EOF
+          fi
+
+      - name: Résolution conflits Kotlin
+        run: |
+          echo "configurations.all { exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk7'; exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk8' }" >> capacitor-app/android/app/build.gradle
+
+      - name: Compilation APK
+        run: |
+          cd capacitor-app/android
+          chmod +x gradlew
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            ./gradlew assembleRelease
+          else
+            ./gradlew assembleDebug
+          fi
+
+      - name: Renommer APK
+        run: |
+          cd capacitor-app/android/app/build/outputs/apk/
+          if [ -d "release" ]; then
+            mv release/app-release.apk ../../../../../Recorder5.apk
+          else
+            mv debug/app-debug.apk ../../../../../Recorder5.apk
+          fi
+
+      - name: Publication en Release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "capacitor-app/Recorder5.apk"
+          tag: "v${{ github.run_number }}"
+          name: "Recorder5 v${{ github.run_number }}"
+          allowUpdates: false
+          prerelease: true
+          token: ${{ secrets.GITHUB_TOKEN }}
